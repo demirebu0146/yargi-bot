@@ -76,7 +76,7 @@ async def yargi_mcp_call(method_name: str, arguments: dict) -> dict:
             r = await client.post(
                 YARGI_MCP_URL,
                 json=payload,
-                headers={"Content-Type": "application/json"}
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
             )
             data = r.json()
             content = data.get("result", {}).get("content", [{}])
