@@ -20,7 +20,7 @@ TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 YARGI_MCP_URL     = "https://yargimcp.surucu.dev/mcp"
 
-MODEL         = "claude-sonnet-4-20250514"
+MODEL         = "claude-sonnet-4-6"
 MAX_HISTORY   = 10
 MAX_MSG_LEN   = 4000
 BASE_HEADERS  = {
