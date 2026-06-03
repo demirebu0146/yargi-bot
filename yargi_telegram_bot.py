@@ -1,286 +1,231 @@
 """
-Yargı MCP Telegram Botu
-========================
-Claude API + Türk hukuk araçları (mevzuat.gov.tr & yargı kararları)
+Yargı MCP Telegram Botu v3
+==========================
+yargi-mcp Python paketi üzerinden gerçek veritabanına bağlanır.
 Railway üzerinde 7/24 çalışır.
 """
 
 import asyncio
 import logging
 import os
+import json
+import re
 import httpx
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
 
-# ─── Yapılandırma ─────────────────────────────────────────────────────────────
-
+# ── Yapılandırma ─────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+YARGI_MCP_URL     = "https://yargimcp.surucu.dev/mcp"
 
-MODEL           = "claude-sonnet-4-6"
-MAX_HISTORY     = 20
-MAX_MESSAGE_LEN = 4096
-
-# ─── Loglama ──────────────────────────────────────────────────────────────────
+MODEL          = "claude-sonnet-4-20250514"
+MAX_HISTORY    = 10
+MAX_MSG_LEN    = 4000
+# ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO
 )
-log = logging.getLogger(__name__)
-
-# ─── Araç tanımları ───────────────────────────────────────────────────────────
-
-TOOLS = [
-    {
-        "name": "search_mevzuat",
-        "description": (
-            "Türk mevzuatında (kanun, yönetmelik, tüzük, vb.) arama yapar. "
-            "mevzuat.gov.tr üzerinden çalışır. "
-            "Kullanıcı bir kanun veya yönetmelik hakkında soru sorduğunda kullan."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Aranacak terim veya cümle (Türkçe)"
-                },
-                "mevzuat_tur": {
-                    "type": "string",
-                    "description": "Mevzuat türü filtresi (opsiyonel)",
-                    "enum": ["kanun", "yonetmelik", "tuzuk", "kararname", "hepsi"]
-                }
-            },
-            "required": ["query"]
-        }
-    },
-    {
-        "name": "get_mevzuat_document",
-        "description": "Belirli bir mevzuatın bilgilerini ve linkini getirir.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "mevzuat_no": {
-                    "type": "string",
-                    "description": "Mevzuat numarası (örn: '6098' Türk Borçlar Kanunu için)"
-                }
-            },
-            "required": ["mevzuat_no"]
-        }
-    },
-    {
-        "name": "search_yargi_kararlari",
-        "description": (
-            "Yargıtay kararlarında arama yapar. "
-            "İçtihat araştırması için kullan."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Aranacak hukuki konu veya terim"
-                }
-            },
-            "required": ["query"]
-        }
-    }
-]
-
-# ─── Araç fonksiyonları ───────────────────────────────────────────────────────
-
-async def search_mevzuat(query: str, mevzuat_tur: str = "hepsi") -> str:
-    tur_map = {"kanun": "1", "yonetmelik": "9", "tuzuk": "6", "kararname": "4", "hepsi": ""}
-    tur_kodu = tur_map.get(mevzuat_tur, "")
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://www.mevzuat.gov.tr/Mevzuat/SearchMevzuatFaset",
-                json={"searchText": query, "mevzuatTur": tur_kodu, "pageSize": 5, "pageNumber": 1},
-                headers={"Content-Type": "application/json"},
-            )
-        if resp.status_code != 200:
-            return f"mevzuat.gov.tr yanıt vermedi (HTTP {resp.status_code})"
-        data = resp.json()
-        sonuclar = data.get("data", {}).get("mevzuatlar", [])
-        if not sonuclar:
-            return "Aramanızla eşleşen mevzuat bulunamadı."
-        lines = [f"*Mevzuat Arama: '{query}'*\n"]
-        for i, m in enumerate(sonuclar[:5], 1):
-            ad    = m.get("mevzuatAdi", "—")
-            no    = m.get("mevzuatNo", "—")
-            tur   = m.get("mevzuatTurAdi", "—")
-            tarih = m.get("resmiGazeteTarihi", "")
-            lines.append(f"{i}\\. *{ad}* (No: {no})\n   Tür: {tur} | {tarih}")
-        return "\n".join(lines)
-    except Exception as e:
-        log.error(f"search_mevzuat hatası: {e}")
-        return f"Mevzuat araması sırasında hata oluştu: {e}"
-
-
-async def get_mevzuat_document(mevzuat_no: str) -> str:
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://www.mevzuat.gov.tr/Mevzuat/SearchMevzuatFaset",
-                json={"mevzuatNo": mevzuat_no, "pageSize": 1},
-                headers={"Content-Type": "application/json"},
-            )
-        if resp.status_code == 200:
-            liste = resp.json().get("data", {}).get("mevzuatlar", [])
-            if liste:
-                m = liste[0]
-                return (
-                    f"*{m.get('mevzuatAdi', '—')}*\n"
-                    f"Tür: {m.get('mevzuatTurAdi', '—')} | No: {no}\n"
-                    f"Resmî Gazete: {m.get('resmiGazeteTarihi', '—')} sayı {m.get('resmiGazeteSayi', '—')}\n"
-                    f"[PDF için tıkla](https://www.mevzuat.gov.tr/mevzuatmetin/{mevzuat_no}.pdf)"
-                )
-        return f"Mevzuat No {mevzuat_no} için bilgi bulunamadı."
-    except Exception as e:
-        return f"Belge getirilirken hata: {e}"
-
-
-async def search_yargi_kararlari(query: str) -> str:
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://karararama.yargitay.gov.tr/YargitayBilgiBankasiIstemciWeb/yargitay/rest/getSearchResults",
-                json={"arananKelime": query, "pageSize": 5, "pageNumber": 0},
-                headers={"Content-Type": "application/json"},
-            )
-        if resp.status_code != 200:
-            return (
-                f"Yargıtay arama servisi yanıt vermedi\\.\n"
-                f"Manuel arama: https://karararama\\.yargitay\\.gov\\.tr"
-            )
-        kararlar = resp.json().get("data", []) or []
-        if not kararlar:
-            return f"'{query}' ile ilgili karar bulunamadı\\."
-        lines = [f"*Yargıtay Kararları: '{query}'*\n"]
-        for i, k in enumerate(kararlar[:5], 1):
-            esas  = k.get("esasNo", "—")
-            karar = k.get("kararNo", "—")
-            tarih = k.get("kararTarihi", "—")
-            daire = k.get("daireAdi", "—")
-            ozet  = (k.get("kararOzeti", "") or "")[:200]
-            lines.append(
-                f"{i}\\. *{daire}* | Esas: {esas} | Karar: {karar} | {tarih}\n"
-                f"   {ozet}{'…' if len(ozet)==200 else ''}"
-            )
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Yargı kararı araması hatası: {e}"
-
-
-async def run_tool(name: str, inp: dict) -> str:
-    if name == "search_mevzuat":
-        return await search_mevzuat(inp["query"], inp.get("mevzuat_tur", "hepsi"))
-    elif name == "get_mevzuat_document":
-        return await get_mevzuat_document(inp["mevzuat_no"])
-    elif name == "search_yargi_kararlari":
-        return await search_yargi_kararlari(inp["query"])
-    return f"Bilinmeyen araç: {name}"
-
-# ─── Claude istemcisi ──────────────────────────────────────────────────────────
-
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-SYSTEM_PROMPT = """Sen uzman bir Türk hukuk asistanısın. Kullanıcıların Türk hukuku sorularını yanıtlarsın.
-
-Görevin:
-- Türk mevzuatını (kanun, yönetmelik, tüzük vb.) araştırmak ve açıklamak
-- Yargıtay ve Danıştay kararlarını bulmak
-- Hukuki terimleri sade Türkçe ile açıklamak
-- Gerektiğinde ilgili kanun maddelerini alıntılamak
-
-Kurallar:
-- Yanıt vermeden önce ilgili araçları kullan
-- Kısa ve öz yanıtlar ver
-- Gerekirse kullanıcıya avukat veya noter ile görüşmesini öner
-- Telegram MarkdownV2 formatı kullan"""
+logger = logging.getLogger(__name__)
 
 user_histories: dict[int, list] = {}
 
+BIRIM_MAP = {
+    "hgk": "HGK", "hukuk genel kurulu": "HGK",
+    "cgk": "CGK", "ceza genel kurulu": "CGK",
+    **{f"{i}. hd": f"H{i}" for i in range(1, 24)},
+    **{f"{i}. hukuk dairesi": f"H{i}" for i in range(1, 24)},
+    **{f"{i}. hukuk": f"H{i}" for i in range(1, 24)},
+    **{f"{i}. cd": f"C{i}" for i in range(1, 24)},
+    **{f"{i}. ceza dairesi": f"C{i}" for i in range(1, 24)},
+    **{f"{i}. ceza": f"C{i}" for i in range(1, 24)},
+}
 
-async def ask_claude(chat_id: int, user_message: str) -> str:
-    history = user_histories.setdefault(chat_id, [])
-    history.append({"role": "user", "content": user_message})
-    if len(history) > MAX_HISTORY:
-        history[:] = history[-MAX_HISTORY:]
+SYSTEM_PROMPT = """Sen bir Türk hukuk asistanısın. Sana YargiMCP veritabanından çekilmiş GERÇEK karar verileri JSON olarak verilecek.
 
-    messages = list(history)
+KURALLAR:
+1. ASLA karar numarası, tarih veya içerik uydurma.
+2. Sadece verilen JSON verilerindeki gerçek bilgileri kullan.
+3. Karar bulunamazsa dürüstçe söyle ve farklı arama öner.
+4. Kararları şu formatta özetle:
+   📋 *Esas:* 2015/388 | *Karar:* 2015/967
+   🏛 *Daire:* Hukuk Genel Kurulu
+   📅 *Tarih:* 04.03.2015
+   📌 *Konu:* kısa özet
+5. Telegram Markdown kullan (*kalın*, _italik_).
+6. Maksimum 5 karar göster."""
 
-    while True:
-        response = claude.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
+
+async def yargi_mcp_call(method_name: str, arguments: dict) -> dict:
+    """YargiMCP'ye JSON-RPC isteği gönderir."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": method_name,
+            "arguments": arguments
+        }
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                YARGI_MCP_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            data = r.json()
+            content = data.get("result", {}).get("content", [{}])
+            text = content[0].get("text", "{}") if content else "{}"
+            try:
+                return json.loads(text)
+            except Exception:
+                return {"raw": text}
+    except Exception as e:
+        logger.error(f"YargiMCP hatası: {e}")
+        return {"error": str(e), "decisions": []}
+
+
+def detect_intent(message: str):
+    """Mesajdan daire, esas no ve karar no çıkarır."""
+    msg_lower = message.lower()
+
+    birim = None
+    for key, val in BIRIM_MAP.items():
+        if key in msg_lower:
+            birim = val
+            break
+
+    esas_match  = re.search(r'(\d{4})\s*/\s*(\d+)\s*[Ee]', message)
+    karar_match = re.search(r'(\d{4})\s*/\s*(\d+)\s*[Kk]', message)
+    esas_no  = f"{esas_match.group(1)}/{esas_match.group(2)}"   if esas_match  else None
+    karar_no = f"{karar_match.group(1)}/{karar_match.group(2)}" if karar_match else None
+
+    return birim, esas_no, karar_no
+
+
+async def handle_query(user_id: int, user_message: str) -> str:
+    birim, esas_no, karar_no = detect_intent(user_message)
+
+    arguments = {
+        "court_types": ["YARGITAYKARARI"],
+        "page_size": 5,
+        "sort_direction": "desc"
+    }
+    if birim:    arguments["birimAdi"] = birim
+    if esas_no:  arguments["esas_no"]  = esas_no
+    if karar_no: arguments["karar_no"] = karar_no
+    if not any([birim, esas_no, karar_no]):
+        arguments["query"] = user_message
+
+    result = await yargi_mcp_call("search_bedesten_unified", arguments)
+
+    error     = result.get("error")
+    decisions = result.get("decisions", [])
+    total     = result.get("total_records", 0)
+
+    if error:
+        return (
+            f"⚠️ YargiMCP bağlantı hatası: `{error}`\n\n"
+            "Lütfen birkaç dakika sonra tekrar deneyin."
         )
 
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    log.info(f"Araç: {block.name} | {block.input}")
-                    result = await run_tool(block.name, block.input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
-        else:
-            reply = "\n".join(b.text for b in response.content if hasattr(b, "text")).strip()
-            history.append({"role": "assistant", "content": reply})
-            return reply
+    if not decisions:
+        return (
+            "❌ Bu sorgu için veritabanında karar bulunamadı.\n\n"
+            "💡 *Farklı şekilde deneyin:*\n"
+            "• `Yargıtay 4. HD son kararları`\n"
+            "• `2015/967 K.`\n"
+            "• `muris muvazaası tapu iptali`\n"
+            "• `iş kazası tazminat 9. HD`"
+        )
 
-# ─── Telegram handler'ları ─────────────────────────────────────────────────────
+    if user_id not in user_histories:
+        user_histories[user_id] = []
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Merhaba! Ben Türk hukuku asistanınım.\n\n"
-        "Kanunlar, yönetmelikler veya yargı kararları hakkında soru sorabilirsin.\n\n"
-        "Örnek: *İş sözleşmesi feshinde ihbar süresi ne kadar?*\n\n"
-        "Geçmişi sıfırlamak için /temizle",
-        parse_mode="Markdown",
+    context = (
+        f"Kullanıcı sorusu: {user_message}\n\n"
+        f"YargiMCP'den çekilen GERÇEK veriler "
+        f"(toplam {total} kayıt, ilk {len(decisions)} gösteriliyor):\n"
+        f"{json.dumps(decisions, ensure_ascii=False, indent=2)}\n\n"
+        "Yukarıdaki gerçek verileri kullanarak yanıtla. "
+        "JSON'da olmayan hiçbir bilgi ekleme."
     )
 
-async def cmd_temizle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_histories.pop(update.effective_chat.id, None)
-    await update.message.reply_text("✅ Konuşma geçmişi temizlendi.")
+    user_histories[user_id].append({"role": "user", "content": context})
+    history = user_histories[user_id][-MAX_HISTORY:]
 
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id   = update.effective_chat.id
-    user_text = update.message.text.strip()
-    if not user_text:
-        return
-    await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        reply = await ask_claude(chat_id, user_text)
-    except Exception as e:
-        log.error(f"Claude hatası: {e}")
-        reply = f"⚠️ Bir hata oluştu: {e}"
-    for i in range(0, len(reply), MAX_MESSAGE_LEN):
-        try:
-            await update.message.reply_text(reply[i:i+MAX_MESSAGE_LEN], parse_mode="MarkdownV2")
-        except Exception:
-            await update.message.reply_text(reply[i:i+MAX_MESSAGE_LEN])
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1500,
+            system=SYSTEM_PROMPT,
+            messages=history,
+        )
+        reply = "".join(b.text for b in response.content if hasattr(b, "text"))
+        if not reply:
+            reply = "Sonuç alınamadı, lütfen tekrar deneyin."
 
-# ─── Ana fonksiyon ────────────────────────────────────────────────────────────
+        user_histories[user_id].append({"role": "assistant", "content": reply})
+        return reply
+
+    except anthropic.RateLimitError:
+        return "⚠️ API kotası doldu. Birkaç dakika bekleyip tekrar deneyin."
+    except Exception as e:
+        logger.error(f"Claude hatası: {e}")
+        return f"⚠️ Hata: {e}"
+
+
+# ── Telegram handlers ─────────────────────────────────────────────────────────
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_histories[update.effective_user.id] = []
+    await update.message.reply_text(
+        "⚖️ *Yargıtay Karar Botu*\n\n"
+        "Gerçek YargiMCP veritabanına bağlıyım.\n\n"
+        "*Örnek sorgular:*\n"
+        "• `Yargıtay 12. HD son kararları`\n"
+        "• `HGK 2015/967 K.`\n"
+        "• `Muris muvazaası içtihatları`\n"
+        "• `İş kazası tazminat 9. HD`\n\n"
+        "/sifirla — sohbeti temizle",
+        parse_mode="Markdown"
+    )
+
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_histories[update.effective_user.id] = []
+    await update.message.reply_text("🔄 Sohbet temizlendi.")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action="typing"
+    )
+    reply = await handle_query(update.effective_user.id, update.message.text)
+
+    for i in range(0, len(reply), MAX_MSG_LEN):
+        chunk = reply[i:i+MAX_MSG_LEN]
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(chunk)
+
 
 def main():
+    logger.info("Yargıtay Botu v3 başlatılıyor...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("temizle", cmd_temizle))
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("sifirla", reset_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    log.info("Bot başlatıldı.")
-    app.run_polling(drop_pending_updates=True)
+    logger.info("✅ Bot çalışıyor.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
