@@ -1,7 +1,7 @@
 """
-Yargı MCP Telegram Botu v4
+Yargı MCP Telegram Botu v5
 ==========================
-MCP protokolü: önce session aç, sonra sorgu yap.
+Session ID header ile gönderilir + initialized notification atılır.
 """
 
 import asyncio
@@ -18,12 +18,12 @@ import anthropic
 # ── Yapılandırma ─────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-YARGI_MCP_BASE    = "https://yargimcp.surucu.dev"
+YARGI_MCP_URL     = "https://yargimcp.surucu.dev/mcp"
 
 MODEL         = "claude-sonnet-4-20250514"
 MAX_HISTORY   = 10
 MAX_MSG_LEN   = 4000
-HEADERS       = {
+BASE_HEADERS  = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream"
 }
@@ -63,15 +63,38 @@ KURALLAR:
 6. Maksimum 5 karar göster."""
 
 
+def parse_mcp_response(text: str) -> dict:
+    """
+    Yanıt 'event: message\\ndata: {...}' formatında (SSE) olabilir.
+    JSON kısmını ayıkla.
+    """
+    text = text.strip()
+    # SSE formatı: "data: {...}" satırını bul
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            json_str = line[len("data:"):].strip()
+            try:
+                return json.loads(json_str)
+            except Exception:
+                pass
+    # Düz JSON dene
+    try:
+        return json.loads(text)
+    except Exception:
+        return {}
+
+
 async def mcp_call(tool_name: str, arguments: dict) -> dict:
     """
-    MCP protokolü:
-    1. POST /mcp → initialize → session_id al
-    2. POST /mcp?sessionId=... → tools/call
+    MCP akışı:
+    1. initialize → session_id (header'dan)
+    2. notifications/initialized
+    3. tools/call (session_id header ile)
     """
     async with httpx.AsyncClient(timeout=30) as client:
 
-        # Adım 1: Initialize — session aç
+        # 1) Initialize
         init_payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -79,56 +102,44 @@ async def mcp_call(tool_name: str, arguments: dict) -> dict:
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "yargi-bot", "version": "4.0"}
+                "clientInfo": {"name": "yargi-bot", "version": "5.0"}
             }
         }
         try:
-            r1 = await client.post(
-                f"{YARGI_MCP_BASE}/mcp",
-                json=init_payload,
-                headers=HEADERS
-            )
-            logger.info(f"Init status: {r1.status_code}, body: {r1.text[:200]}")
+            r1 = await client.post(YARGI_MCP_URL, json=init_payload, headers=BASE_HEADERS)
         except Exception as e:
             return {"error": f"Initialize hatası: {e}", "decisions": []}
 
-        # Session ID header'dan veya URL'den al
-        session_id = r1.headers.get("mcp-session-id") or r1.headers.get("x-session-id")
-
-        # Header'da yoksa body'den dene
-        if not session_id:
-            try:
-                body = r1.json()
-                session_id = (
-                    body.get("sessionId") or
-                    body.get("result", {}).get("sessionId") or
-                    body.get("id")
-                )
-            except Exception:
-                pass
-
+        session_id = r1.headers.get("mcp-session-id")
         logger.info(f"Session ID: {session_id}")
-        logger.info(f"Response headers: {dict(r1.headers)}")
 
-        # Adım 2: Tool çağrısı
+        if not session_id:
+            return {"error": "Session ID alınamadı", "decisions": []}
+
+        # Session header'ı ekle
+        sess_headers = {**BASE_HEADERS, "mcp-session-id": session_id}
+
+        # 2) initialized notification (zorunlu)
+        notif_payload = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }
+        try:
+            await client.post(YARGI_MCP_URL, json=notif_payload, headers=sess_headers)
+        except Exception as e:
+            logger.warning(f"Notification hatası (kritik değil): {e}")
+
+        # 3) Tool call
         tool_payload = {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": arguments
-            }
+            "params": {"name": tool_name, "arguments": arguments}
         }
-
-        url = f"{YARGI_MCP_BASE}/mcp"
-        if session_id:
-            url = f"{YARGI_MCP_BASE}/mcp?sessionId={session_id}"
-
         try:
-            r2 = await client.post(url, json=tool_payload, headers=HEADERS)
-            logger.info(f"Tool call status: {r2.status_code}, body: {r2.text[:300]}")
-            data = r2.json()
+            r3 = await client.post(YARGI_MCP_URL, json=tool_payload, headers=sess_headers)
+            logger.info(f"Tool call status: {r3.status_code}, body: {r3.text[:300]}")
+            data = parse_mcp_response(r3.text)
             content = data.get("result", {}).get("content", [{}])
             text = content[0].get("text", "{}") if content else "{}"
             try:
@@ -179,7 +190,7 @@ async def handle_query(user_id: int, user_message: str) -> str:
 
     if raw and not decisions:
         logger.warning(f"Ham yanıt: {raw[:300]}")
-        return f"⚠️ Beklenmeyen yanıt alındı. Log: `{raw[:200]}`"
+        return f"⚠️ Beklenmeyen yanıt. Log: `{raw[:200]}`"
 
     if not decisions:
         return (
@@ -208,10 +219,8 @@ async def handle_query(user_id: int, user_message: str) -> str:
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
-            model=MODEL,
-            max_tokens=1500,
-            system=SYSTEM_PROMPT,
-            messages=history,
+            model=MODEL, max_tokens=1500,
+            system=SYSTEM_PROMPT, messages=history,
         )
         reply = "".join(b.text for b in response.content if hasattr(b, "text"))
         if not reply:
@@ -257,12 +266,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    logger.info("Yargıtay Botu v4 başlatılıyor...")
+    logger.info("Yargıtay Botu v5 başlatılıyor...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("sifirla", reset_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("✅ Bot v4 çalışıyor.")
+    logger.info("✅ Bot v5 çalışıyor.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
