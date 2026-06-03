@@ -173,7 +173,6 @@ async def handle_query(user_id: int, user_message: str) -> str:
 
     arguments = {
         "court_types": ["YARGITAYKARARI"],
-        "sort_direction": "desc",
         "phrase": build_phrase(user_message),   # ← HER ZAMAN gönderilir
     }
     if birim:    arguments["birimAdi"] = birim
