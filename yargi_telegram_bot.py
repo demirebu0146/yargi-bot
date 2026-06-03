@@ -1,7 +1,7 @@
 """
-Yargı MCP Telegram Botu v5
+Yargı MCP Telegram Botu v6
 ==========================
-Session ID header ile gönderilir + initialized notification atılır.
+phrase parametresi her zaman gönderilir (zorunlu).
 """
 
 import asyncio
@@ -48,6 +48,16 @@ BIRIM_MAP = {
     **{f"{i}. ceza": f"C{i}" for i in range(1, 24)},
 }
 
+# Sorgu cümlesinden çıkarılacak "gürültü" kelimeleri
+STOPWORDS = {
+    "yargıtay", "danıştay", "kararı", "kararları", "karar", "son", "en",
+    "hd", "cd", "hgk", "cgk", "daire", "dairesi", "hukuk", "ceza",
+    "bul", "göster", "ver", "bana", "lütfen", "istiyorum", "nedir",
+    "ile", "ve", "için", "bir", "bu", "şu", "o", "adet",
+    *[str(i) for i in range(1, 51)],
+    *[f"{i}." for i in range(1, 51)],
+}
+
 SYSTEM_PROMPT = """Sen bir Türk hukuk asistanısın. Sana YargiMCP veritabanından çekilmiş GERÇEK karar verileri JSON olarak verilecek.
 
 KURALLAR:
@@ -55,21 +65,18 @@ KURALLAR:
 2. Sadece verilen JSON verilerindeki gerçek bilgileri kullan.
 3. Karar bulunamazsa dürüstçe söyle ve farklı arama öner.
 4. Kararları şu formatta özetle:
-   📋 *Esas:* 2015/388 | *Karar:* 2015/967
-   🏛 *Daire:* Hukuk Genel Kurulu
-   📅 *Tarih:* 04.03.2015
-   📌 *Konu:* kısa özet
+   📋 *Esas:* 2025/4534 | *Karar:* 2026/2436
+   🏛 *Daire:* 1. Hukuk Dairesi
+   📅 *Tarih:* 31.03.2026
+   📌 *Konu:* kısa özet (varsa)
 5. Telegram Markdown kullan (*kalın*, _italik_).
-6. Maksimum 5 karar göster."""
+6. Maksimum 5 karar göster.
+7. Karar metnini görmek isterse documentId'yi kullanabileceğini belirt."""
 
 
 def parse_mcp_response(text: str) -> dict:
-    """
-    Yanıt 'event: message\\ndata: {...}' formatında (SSE) olabilir.
-    JSON kısmını ayıkla.
-    """
+    """SSE ('data: {...}') veya düz JSON yanıtı ayrıştırır."""
     text = text.strip()
-    # SSE formatı: "data: {...}" satırını bul
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("data:"):
@@ -78,7 +85,6 @@ def parse_mcp_response(text: str) -> dict:
                 return json.loads(json_str)
             except Exception:
                 pass
-    # Düz JSON dene
     try:
         return json.loads(text)
     except Exception:
@@ -86,23 +92,16 @@ def parse_mcp_response(text: str) -> dict:
 
 
 async def mcp_call(tool_name: str, arguments: dict) -> dict:
-    """
-    MCP akışı:
-    1. initialize → session_id (header'dan)
-    2. notifications/initialized
-    3. tools/call (session_id header ile)
-    """
+    """MCP: initialize → initialized → tools/call"""
     async with httpx.AsyncClient(timeout=30) as client:
 
         # 1) Initialize
         init_payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "yargi-bot", "version": "5.0"}
+                "clientInfo": {"name": "yargi-bot", "version": "6.0"}
             }
         }
         try:
@@ -111,34 +110,29 @@ async def mcp_call(tool_name: str, arguments: dict) -> dict:
             return {"error": f"Initialize hatası: {e}", "decisions": []}
 
         session_id = r1.headers.get("mcp-session-id")
-        logger.info(f"Session ID: {session_id}")
-
         if not session_id:
             return {"error": "Session ID alınamadı", "decisions": []}
 
-        # Session header'ı ekle
         sess_headers = {**BASE_HEADERS, "mcp-session-id": session_id}
 
-        # 2) initialized notification (zorunlu)
-        notif_payload = {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }
+        # 2) initialized notification
         try:
-            await client.post(YARGI_MCP_URL, json=notif_payload, headers=sess_headers)
+            await client.post(
+                YARGI_MCP_URL,
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                headers=sess_headers
+            )
         except Exception as e:
-            logger.warning(f"Notification hatası (kritik değil): {e}")
+            logger.warning(f"Notification hatası: {e}")
 
         # 3) Tool call
         tool_payload = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": tool_name, "arguments": arguments}
         }
         try:
             r3 = await client.post(YARGI_MCP_URL, json=tool_payload, headers=sess_headers)
-            logger.info(f"Tool call status: {r3.status_code}, body: {r3.text[:300]}")
+            logger.info(f"Tool call status: {r3.status_code}")
             data = parse_mcp_response(r3.text)
             content = data.get("result", {}).get("content", [{}])
             text = content[0].get("text", "{}") if content else "{}"
@@ -148,6 +142,16 @@ async def mcp_call(tool_name: str, arguments: dict) -> dict:
                 return {"raw": text, "decisions": []}
         except Exception as e:
             return {"error": f"Tool call hatası: {e}", "decisions": []}
+
+
+def build_phrase(message: str) -> str:
+    """Mesajdan hukuki anahtar kelimeleri çıkarır (gürültüyü atar)."""
+    # Esas/karar no varsa phrase'e gerek yok ama yine de boş bırakmamak için
+    words = re.findall(r'[a-zA-ZçşğıİöüÇŞĞIÖÜ]+', message)
+    keywords = [w for w in words if w.lower() not in STOPWORDS and len(w) > 2]
+    phrase = " ".join(keywords).strip()
+    # Hiç anlamlı kelime kalmadıysa genel bir terim kullan
+    return phrase if phrase else "karar"
 
 
 def detect_intent(message: str):
@@ -170,13 +174,12 @@ async def handle_query(user_id: int, user_message: str) -> str:
     arguments = {
         "court_types": ["YARGITAYKARARI"],
         "page_size": 5,
-        "sort_direction": "desc"
+        "sort_direction": "desc",
+        "phrase": build_phrase(user_message),   # ← HER ZAMAN gönderilir
     }
     if birim:    arguments["birimAdi"] = birim
     if esas_no:  arguments["esas_no"]  = esas_no
     if karar_no: arguments["karar_no"] = karar_no
-    if not any([birim, esas_no, karar_no]):
-        arguments["query"] = user_message
 
     result = await mcp_call("search_bedesten_unified", arguments)
 
@@ -196,9 +199,9 @@ async def handle_query(user_id: int, user_message: str) -> str:
         return (
             "❌ Bu sorgu için veritabanında karar bulunamadı.\n\n"
             "💡 *Farklı şekilde deneyin:*\n"
-            "• `Yargıtay 4. HD son kararları`\n"
+            "• `Yargıtay 1. HD tapu iptali`\n"
             "• `2015/967 K.`\n"
-            "• `muris muvazaası tapu iptali`\n"
+            "• `muris muvazaası`\n"
             "• `iş kazası tazminat 9. HD`"
         )
 
@@ -242,9 +245,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚖️ *Yargıtay Karar Botu*\n\n"
         "Gerçek YargiMCP veritabanına bağlıyım.\n\n"
         "*Örnek sorgular:*\n"
-        "• `Yargıtay 12. HD son kararları`\n"
+        "• `Yargıtay 1. HD tapu iptali`\n"
         "• `HGK 2015/967 K.`\n"
-        "• `Muris muvazaası içtihatları`\n"
+        "• `Muris muvazaası kararları`\n"
         "• `İş kazası tazminat 9. HD`\n\n"
         "/sifirla — sohbeti temizle",
         parse_mode="Markdown"
@@ -266,12 +269,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    logger.info("Yargıtay Botu v5 başlatılıyor...")
+    logger.info("Yargıtay Botu v6 başlatılıyor...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("sifirla", reset_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("✅ Bot v5 çalışıyor.")
+    logger.info("✅ Bot v6 çalışıyor.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
